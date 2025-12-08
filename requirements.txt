@@ -1,0 +1,16 @@
+azure-ai-inference>=1.0.0b9
+azure-identity>=1.25.0
+azure-storage-blob>=12.26.0
+azure-core>=1.30.0
+python-dotenv>=1.0.0
+weasyprint>=66.0
+python-docx>=1.2.0
+tree-sitter>=0.25.0
+
+# Optional enhanced features
+markdown2>=2.4.0
+tree-sitter-python>=0.25.0
+tree-sitter-javascript>=0.25.0
+
+# Azure AI Foundry Agent SDK (optional - for multi-agent orchestration)
+# azure-ai-projects>=1.0.0b1

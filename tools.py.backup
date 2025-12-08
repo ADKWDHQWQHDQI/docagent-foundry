@@ -1,0 +1,653 @@
+"""
+Custom Tools for Code Analysis and Documentation Rendering
+Provides utilities for parsing code, analyzing structure, and rendering docs
+Includes Azure Blob Storage integration for enterprise deployments
+"""
+
+import os
+import ast
+import json
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional
+from docx import Document
+import tree_sitter
+from dotenv import load_dotenv
+
+# Optional imports for enhanced functionality
+# Note: WeasyPrint requires GTK+ libraries on Windows, which can be difficult to install
+# We skip it on Windows and use ReportLab instead (Windows-friendly)
+WEASYPRINT_AVAILABLE = False
+import sys
+
+if sys.platform != 'win32':  # Only try WeasyPrint on non-Windows systems
+    try:
+        from weasyprint import HTML  # type: ignore
+        WEASYPRINT_AVAILABLE = True
+    except (ImportError, OSError):
+        WEASYPRINT_AVAILABLE = False
+        HTML = None  # type: ignore
+else:
+    HTML = None  # type: ignore
+
+# Alternative PDF generation libraries (Windows-friendly)
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+try:
+    import pdfkit  # type: ignore
+    PDFKIT_AVAILABLE = True
+except ImportError:
+    PDFKIT_AVAILABLE = False
+    pdfkit = None  # type: ignore
+
+# Check if any PDF generation is available
+PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE or PDFKIT_AVAILABLE
+if not PDF_AVAILABLE:
+    print("⚠️  No PDF generation libraries available.")
+    print("   Install one of: pip install reportlab  (recommended for Windows)")
+    print("                or: pip install pdfkit + wkhtmltopdf")
+    print("                or: WeasyPrint + GTK+ libraries")
+
+try:
+    from azure.storage.blob import BlobServiceClient
+    AZURE_BLOB_AVAILABLE = True
+except ImportError:
+    AZURE_BLOB_AVAILABLE = False
+    BlobServiceClient = None  # type: ignore
+    print("⚠️  Azure Blob Storage not available. Install azure-storage-blob for cloud storage features.")
+
+try:
+    import markdown2  # type: ignore
+    MARKDOWN2_AVAILABLE = True
+except ImportError:
+    MARKDOWN2_AVAILABLE = False
+    markdown2 = None  # type: ignore
+    print("⚠️  markdown2 not available. Using basic markdown conversion.")
+
+try:
+    import tree_sitter_python
+    import tree_sitter_javascript
+    TREE_SITTER_LANGUAGES_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_LANGUAGES_AVAILABLE = False
+    print("⚠️  tree-sitter language bindings not available. Advanced parsing disabled.")
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Azure Blob client if available
+blob_service_client = None
+if AZURE_BLOB_AVAILABLE:
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if connection_string and BlobServiceClient is not None:
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        except Exception as e:
+            print(f"⚠️  Could not initialize Azure Blob Storage: {e}")
+
+
+# ============================================================================
+# PDF GENERATION HELPER FUNCTIONS
+# ============================================================================
+
+def generate_pdf_with_reportlab(html_content: str, output_path: str) -> bool:
+    """Generate PDF using ReportLab (Windows-friendly)"""
+    try:
+        from reportlab.lib.pagesizes import letter, A4
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+        from reportlab.lib.colors import HexColor
+        import html as html_lib
+        
+        # Create PDF document
+        doc = SimpleDocTemplate(output_path, pagesize=A4)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Add custom styles
+        styles.add(ParagraphStyle(
+            name='CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=HexColor('#1a1a1a'),
+            spaceAfter=30
+        ))
+        
+        # Parse HTML content (basic parsing)
+        # Remove HTML tags and convert to plain text with formatting
+        import re
+        
+        # Extract title
+        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', html_content, re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = html_lib.unescape(re.sub('<.*?>', '', title_match.group(1)))
+            story.append(Paragraph(title, styles['CustomTitle']))
+            story.append(Spacer(1, 0.3 * inch))
+        
+        # Extract and format content sections
+        sections = re.split(r'<h[2-6][^>]*>(.*?)</h[2-6]>', html_content, flags=re.IGNORECASE | re.DOTALL)
+        
+        for i, section in enumerate(sections):
+            if not section.strip():
+                continue
+                
+            # Clean HTML
+            clean_text = re.sub('<code[^>]*>(.*?)</code>', r'<font name="Courier">\1</font>', section, flags=re.DOTALL)
+            clean_text = re.sub('<pre[^>]*>(.*?)</pre>', r'<font name="Courier">\1</font>', clean_text, flags=re.DOTALL)
+            clean_text = re.sub('<[^>]+>', '', clean_text)
+            clean_text = html_lib.unescape(clean_text).strip()
+            
+            if clean_text:
+                # Add heading or paragraph
+                if i > 0 and i % 2 == 1:  # Headers
+                    story.append(Paragraph(clean_text, styles['Heading2']))
+                    story.append(Spacer(1, 0.2 * inch))
+                else:  # Content
+                    # Split into paragraphs
+                    paragraphs = clean_text.split('\n\n')
+                    for para in paragraphs:
+                        if para.strip():
+                            # Check if it's code (indented)
+                            if para.startswith('    ') or para.startswith('\t'):
+                                story.append(Preformatted(para, styles['Code']))
+                            else:
+                                story.append(Paragraph(para.replace('\n', '<br/>'), styles['BodyText']))
+                            story.append(Spacer(1, 0.1 * inch))
+        
+        # Build PDF
+        doc.build(story)
+        return True
+        
+    except Exception as e:
+        print(f"❌ ReportLab PDF generation failed: {e}")
+        return False
+
+
+def generate_pdf_with_pdfkit(html_content: str, output_path: str) -> bool:
+    """Generate PDF using pdfkit/wkhtmltopdf"""
+    try:
+        import pdfkit  # type: ignore
+        pdfkit.from_string(html_content, output_path)
+        return True
+    except Exception as e:
+        print(f"❌ pdfkit PDF generation failed: {e}")
+        return False
+
+
+def generate_pdf(html_content: str, output_path: str) -> bool:
+    """
+    Generate PDF using available libraries with fallback.
+    Tries: ReportLab → pdfkit → WeasyPrint
+    """
+    # Try ReportLab first (most Windows-compatible)
+    if REPORTLAB_AVAILABLE:
+        if generate_pdf_with_reportlab(html_content, output_path):
+            return True
+    
+    # Try pdfkit
+    if PDFKIT_AVAILABLE:
+        if generate_pdf_with_pdfkit(html_content, output_path):
+            return True
+    
+    # Try WeasyPrint (requires GTK+)
+    if WEASYPRINT_AVAILABLE and HTML is not None:
+        try:
+            HTML(string=html_content).write_pdf(output_path)
+            return True
+        except Exception as e:
+            print(f"❌ WeasyPrint PDF generation failed: {e}")
+            return False
+    
+    print("⚠️  No PDF library available for generation")
+    return False
+
+def analyze_codebase(project_path: str) -> Dict:
+    """
+    Analyze codebase structure and extract key information
+    
+    Args:
+        project_path: Path to the project directory
+        
+    Returns:
+        Dictionary containing codebase analysis
+    """
+    analysis = {
+        'files': [],
+        'structure': {},
+        'dependencies': set(),
+        'functions': [],
+        'classes': []
+    }
+    
+    project_path_obj = Path(project_path)
+    
+    # Walk through project files
+    for file_path in project_path_obj.rglob('*.py'):
+        if '__pycache__' in str(file_path):
+            continue
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # Parse Python AST
+            tree = ast.parse(content)
+            
+            file_info = {
+                'path': str(file_path.relative_to(project_path_obj)),
+                'functions': [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)],
+                'classes': [node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)],
+            }
+            
+            analysis['files'].append(file_info)
+            analysis['functions'].extend(file_info['functions'])
+            analysis['classes'].extend(file_info['classes'])
+            
+            # Extract imports
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        analysis['dependencies'].add(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        analysis['dependencies'].add(node.module)
+                        
+        except Exception as e:
+            print(f"⚠️  Error analyzing {file_path}: {e}")
+    
+    analysis['dependencies'] = list(analysis['dependencies'])
+    
+    return analysis
+
+
+def analyze_codebase_advanced(file_path: str, container: str = "code-inputs") -> str:
+    """
+    Advanced codebase analysis with Tree-sitter and Azure Blob Storage support.
+    Analyzes uploaded codebase (zip/folder) via Tree-sitter; uploads to Blob if configured.
+    
+    Args:
+        file_path: Path to the codebase (local path or blob name)
+        container: Azure Blob container name for code inputs
+        
+    Returns:
+        JSON string containing analysis results
+    """
+    result = {
+        "files_count": 0,
+        "language": "unknown",
+        "endpoints": [],
+        "auth_methods": [],
+        "security_risks": [],
+        "architecture_summary": ""
+    }
+    
+    # Download from Blob if configured and file doesn't exist locally
+    if blob_service_client and not os.path.exists(file_path):
+        try:
+            blob_client = blob_service_client.get_blob_client(container, file_path)
+            with open(f"/tmp/{os.path.basename(file_path)}", "wb") as f:
+                f.write(blob_client.download_blob().readall())
+            file_path = f"/tmp/{os.path.basename(file_path)}"
+        except Exception as e:
+            print(f"⚠️  Could not download from Blob: {e}")
+    
+    # Extract zip if needed
+    if file_path.endswith('.zip'):
+        extract_dir = '/tmp/codebase' if os.name != 'nt' else 'C:/temp/codebase'
+        with zipfile.ZipFile(file_path, 'r') as z:
+            z.extractall(extract_dir)
+        file_path = extract_dir
+    
+    # Analyze files
+    for root, _, files in os.walk(file_path):
+        for file in files:
+            if file.endswith(('.py', '.js', '.ts', '.java', '.go', '.cs')):
+                result["files_count"] += 1
+                full_path = os.path.join(root, file)
+                
+                try:
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        content_lower = content.lower()
+                        
+                        # Detect language
+                        if file.endswith('.py'):
+                            result["language"] = "Python"
+                            if any(x in content_lower for x in ['fastapi', 'flask', '@app.route', 'router.']):
+                                result["language"] = "Python Web"
+                        elif file.endswith(('.js', '.ts')):
+                            result["language"] = "JavaScript/TypeScript"
+                            if 'express' in content_lower:
+                                result["language"] = "Node.js Express"
+                        elif file.endswith('.java'):
+                            result["language"] = "Java"
+                        elif file.endswith('.go'):
+                            result["language"] = "Go"
+                        elif file.endswith('.cs'):
+                            result["language"] = "C#"
+                        
+                        # Detect endpoints
+                        if any(x in content_lower for x in ['route', 'get(', 'post(', 'put(', 'delete(']):
+                            endpoints = [line.strip() for line in content.split('\n') 
+                                       if any(x in line.lower() for x in ['route', 'get(', 'post('])]
+                            result["endpoints"].extend(endpoints[:5])  # Limit to 5 per file
+                        
+                        # Detect authentication
+                        if any(x in content_lower for x in ['jwt', 'oauth', 'passport', 'auth0', 'authentication']):
+                            if "JWT/OAuth" not in result["auth_methods"]:
+                                result["auth_methods"].append("JWT/OAuth detected")
+                        
+                        # Security analysis
+                        if 'password' in content_lower and '=' in content:
+                            result["security_risks"].append(f"Possible hardcoded credential in {file}")
+                        if 'api_key' in content_lower and ('=' in content or '"' in content):
+                            result["security_risks"].append(f"Possible hardcoded API key in {file}")
+                        
+                        # Advanced parsing with tree-sitter if available
+                        if TREE_SITTER_LANGUAGES_AVAILABLE:
+                            try:
+                                if file.endswith('.py'):
+                                    import tree_sitter_python as tspython
+                                    PY_LANGUAGE = tree_sitter.Language(tspython.language())
+                                    parser = tree_sitter.Parser(PY_LANGUAGE)
+                                    tree = parser.parse(content.encode())
+                                    # Additional AST analysis can be added here
+                                elif file.endswith(('.js', '.ts')):
+                                    import tree_sitter_javascript as tsjs
+                                    JS_LANGUAGE = tree_sitter.Language(tsjs.language())
+                                    parser = tree_sitter.Parser(JS_LANGUAGE)
+                                    tree = parser.parse(content.encode())
+                                    # Additional AST analysis can be added here
+                            except Exception as e:
+                                print(f"⚠️  Tree-sitter parsing failed for {file}: {e}")
+                                
+                except Exception as e:
+                    print(f"⚠️  Error analyzing {full_path}: {e}")
+    
+    result["architecture_summary"] = f"{result['files_count']} files analyzed; {len(result['endpoints'])} endpoints detected; {len(result['security_risks'])} security concerns."
+    
+    # Upload summary to Blob if configured
+    if blob_service_client:
+        try:
+            blob_client = blob_service_client.get_blob_client("analysis-output", "summary.json")
+            blob_client.upload_blob(json.dumps(result, indent=2), overwrite=True)
+            print("✅ Analysis uploaded to Azure Blob Storage")
+        except Exception as e:
+            print(f"⚠️  Could not upload to Blob: {e}")
+    
+    return json.dumps(result, indent=2)
+
+def render_documentation(content: str, output_dir: str) -> str:
+    """
+    Render documentation in multiple formats
+    
+    Args:
+        content: Markdown documentation content
+        output_dir: Directory to save output files
+        
+    Returns:
+        Path to the generated documentation
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save as Markdown
+    md_path = os.path.join(output_dir, "documentation.md")
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    # Save as HTML
+    html_path = os.path.join(output_dir, "documentation.html")
+    html_content = markdown_to_html(content)
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    # Save as PDF using available PDF library
+    pdf_path = os.path.join(output_dir, "documentation.pdf")
+    if PDF_AVAILABLE:
+        if generate_pdf(html_content, pdf_path):
+            print(f"✅ PDF generated: {pdf_path}")
+        else:
+            print("⚠️  PDF generation failed")
+    else:
+        print("⚠️  PDF generation skipped (no PDF library available)")
+    
+    # Save as DOCX
+    docx_path = os.path.join(output_dir, "documentation.docx")
+    try:
+        create_docx(content, docx_path)
+        print(f"DOCX generated: {docx_path}")
+    except Exception as e:
+        print(f" DOCX generation failed: {e}")
+    
+    return md_path
+
+
+def render_documents_advanced(markdown_content: str, output_dir: str = "outputs") -> str:
+    """
+    Advanced document rendering with Azure Blob Storage upload support.
+    Renders markdown to PDF/DOCX and uploads to Blob if configured.
+    
+    Args:
+        markdown_content: Markdown documentation content
+        output_dir: Directory to save output files
+        
+    Returns:
+        Status message with file paths
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Convert markdown to HTML
+    if MARKDOWN2_AVAILABLE and markdown2 is not None:
+        html = markdown2.markdown(markdown_content, extras=['fenced-code-blocks', 'tables'])
+    else:
+        # Fallback to basic conversion
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Documentation</title>
+            <style>
+                body {{ 
+                    font-family: Arial, sans-serif; 
+                    max-width: 900px; 
+                    margin: 40px auto; 
+                    padding: 20px;
+                    line-height: 1.6;
+                }}
+                h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+                h2 {{ color: #34495e; margin-top: 30px; border-bottom: 1px solid #bdc3c7; }}
+                h3 {{ color: #7f8c8d; }}
+                code {{ 
+                    background: #f4f4f4; 
+                    padding: 2px 6px; 
+                    border-radius: 3px; 
+                    font-family: 'Courier New', monospace;
+                }}
+                pre {{ 
+                    background: #2c3e50; 
+                    color: #ecf0f1;
+                    padding: 15px; 
+                    border-radius: 5px;
+                    overflow-x: auto;
+                }}
+                table {{ 
+                    border-collapse: collapse; 
+                    width: 100%; 
+                    margin: 20px 0;
+                }}
+                th, td {{ 
+                    border: 1px solid #bdc3c7; 
+                    padding: 12px; 
+                    text-align: left;
+                }}
+                th {{ 
+                    background: #3498db; 
+                    color: white;
+                }}
+            </style>
+        </head>
+        <body>
+            {markdown_content.replace('\n', '<br>')}
+        </body>
+        </html>
+        """
+    
+    # Generate PDF using available PDF library
+    pdf_path = os.path.join(output_dir, "docs.pdf")
+    if PDF_AVAILABLE:
+        if generate_pdf(html, pdf_path):
+            print(f"✅ PDF rendered: {pdf_path}")
+        else:
+            print("⚠️  PDF generation failed")
+            pdf_path = None
+    else:
+        print("⚠️  PDF generation skipped (no PDF library available)")
+        pdf_path = None
+    
+    # Generate DOCX
+    docx_path = os.path.join(output_dir, "docs.docx")
+    try:
+        doc = Document()
+        doc.add_heading('Documentation Package', 0)
+        
+        # Parse markdown content
+        for line in markdown_content.split('\n'):
+            line = line.strip()
+            if line.startswith('# '):
+                doc.add_heading(line[2:], level=1)
+            elif line.startswith('## '):
+                doc.add_heading(line[3:], level=2)
+            elif line.startswith('### '):
+                doc.add_heading(line[4:], level=3)
+            elif line.startswith('#### '):
+                doc.add_heading(line[5:], level=4)
+            elif line.startswith('- ') or line.startswith('* '):
+                doc.add_paragraph(line[2:], style='List Bullet')
+            elif line.startswith('```'):
+                # Skip code fence markers
+                continue
+            elif line:
+                doc.add_paragraph(line)
+        
+        doc.save(docx_path)
+        print(f"DOCX rendered: {docx_path}")
+    except Exception as e:
+        print(f" DOCX generation failed: {e}")
+        docx_path = None
+    
+    # Upload to Azure Blob Storage if configured
+    uploaded_files = []
+    if blob_service_client:
+        try:
+            if pdf_path and os.path.exists(pdf_path):
+                with open(pdf_path, "rb") as f:
+                    blob_client = blob_service_client.get_blob_client("doc-outputs", "docs.pdf")
+                    blob_client.upload_blob(f, overwrite=True)
+                    uploaded_files.append("docs.pdf")
+            
+            if docx_path and os.path.exists(docx_path):
+                with open(docx_path, "rb") as f:
+                    blob_client = blob_service_client.get_blob_client("doc-outputs", "docs.docx")
+                    blob_client.upload_blob(f, overwrite=True)
+                    uploaded_files.append("docs.docx")
+            
+            if uploaded_files:
+                print(f" Uploaded to Azure Blob Storage: {', '.join(uploaded_files)}")
+        except Exception as e:
+            print(f" Could not upload to Blob: {e}")
+    
+    result = f"Rendered documents saved to {output_dir}/"
+    if pdf_path:
+        result += f"\n  - docs.pdf"
+    if docx_path:
+        result += f"\n  - docs.docx"
+    if uploaded_files:
+        result += f"\n  - Uploaded to cloud: {', '.join(uploaded_files)}"
+    
+    return result
+
+def markdown_to_html(markdown_content: str) -> str:
+    """Convert markdown to HTML"""
+    # Simple conversion - consider using markdown library for production
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Documentation</title>
+        <style>
+            body {{ 
+                font-family: Arial, sans-serif; 
+                max-width: 800px; 
+                margin: 40px auto; 
+                padding: 20px;
+                line-height: 1.6;
+            }}
+            h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; }}
+            h2 {{ color: #34495e; margin-top: 30px; }}
+            code {{ 
+                background: #f4f4f4; 
+                padding: 2px 6px; 
+                border-radius: 3px; 
+            }}
+            pre {{ 
+                background: #f4f4f4; 
+                padding: 15px; 
+                border-radius: 5px;
+                overflow-x: auto;
+            }}
+        </style>
+    </head>
+    <body>
+        <div>{markdown_content.replace('\n', '<br>')}</div>
+    </body>
+    </html>
+    """
+    return html
+
+def create_docx(content: str, output_path: str):
+    """Create a DOCX document from content"""
+    doc = Document()
+    doc.add_heading('Project Documentation', 0)
+    
+    # Split content by lines and add to document
+    for line in content.split('\n'):
+        if line.startswith('# '):
+            doc.add_heading(line[2:], 1)
+        elif line.startswith('## '):
+            doc.add_heading(line[3:], 2)
+        elif line.startswith('### '):
+            doc.add_heading(line[4:], 3)
+        elif line.strip():
+            doc.add_paragraph(line)
+    
+    doc.save(output_path)
+
+def parse_code_with_tree_sitter(file_path: str, language: str = 'python') -> Dict:
+    """
+    Parse code using tree-sitter for detailed AST analysis
+    
+    Args:
+        file_path: Path to the code file
+        language: Programming language
+        
+    Returns:
+        Parsed AST information
+    """
+    # Placeholder for tree-sitter integration
+    # Requires language-specific tree-sitter grammar installation
+    return {
+        'file': file_path,
+        'language': language,
+        'note': 'Tree-sitter parsing requires language grammar setup'
+    }
